@@ -30,7 +30,7 @@ MODEL_BIN      = MODEL_XML.with_suffix(".bin")
 # 1. 페이지 설정
 # ─────────────────────────────────────────────
 st.set_page_config(page_title="InspectorsAlly", page_icon=":camera:", layout="centered")
-st.title("InspectorsAlly")
+st.title("가죽이 이상해!")
 st.caption("VGG16 + OpenVINO 기반 가죽 제품 불량 검사")
 
 
