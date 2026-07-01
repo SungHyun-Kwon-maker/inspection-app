@@ -65,6 +65,27 @@ def show_model_path_debug(missing_files):
         )
 
 
+def detect_image_signature(image_bytes):
+    header = image_bytes[:32]
+    stripped = image_bytes[:100].lstrip().lower()
+
+    if header.startswith(b"\xff\xd8\xff"):
+        return "JPEG"
+    if header.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "PNG"
+    if header[:4] == b"RIFF" and header[8:12] == b"WEBP":
+        return "WEBP"
+    if header[4:12] in {b"ftypavif", b"ftypheic", b"ftypheix", b"ftypmif1", b"ftypmsf1"}:
+        return "AVIF/HEIC"
+    if stripped.startswith((b"<!doctype html", b"<html")):
+        return "HTML"
+    return "알 수 없음"
+
+
+def format_header_bytes(image_bytes, length=16):
+    return " ".join(f"{byte:02X}" for byte in image_bytes[:length])
+
+
 def load_input_image(image_file):
     image_bytes = image_file.getvalue()
     if not image_bytes:
@@ -76,11 +97,23 @@ def load_input_image(image_file):
         image.load()
         return ImageOps.exif_transpose(image).convert("RGB")
     except (UnidentifiedImageError, OSError, ValueError) as exc:
-        st.error("이미지를 읽을 수 없습니다. JPG, JPEG, PNG 파일로 다시 저장한 뒤 업로드해주세요.")
+        detected_format = detect_image_signature(image_bytes)
+
+        if detected_format == "HTML":
+            st.error("업로드한 파일 내용이 이미지가 아니라 웹페이지(HTML)로 보입니다. 이미지를 다시 다운로드해주세요.")
+        elif detected_format == "AVIF/HEIC":
+            st.error("이 파일은 JPG가 아니라 AVIF/HEIC 계열로 보입니다. JPG 또는 PNG로 변환한 뒤 업로드해주세요.")
+        elif detected_format == "WEBP":
+            st.error("이 파일은 JPG가 아니라 WebP로 보입니다. JPG 또는 PNG로 변환한 뒤 업로드해주세요.")
+        else:
+            st.error("이미지를 읽을 수 없습니다. JPG, JPEG, PNG 파일로 다시 저장한 뒤 업로드해주세요.")
+
         with st.expander("파일 정보"):
             st.write("파일명:", getattr(image_file, "name", "카메라 입력"))
-            st.write("파일 형식:", getattr(image_file, "type", "알 수 없음"))
+            st.write("브라우저가 보낸 파일 형식:", getattr(image_file, "type", "알 수 없음"))
+            st.write("감지된 파일 내용:", detected_format)
             st.write("파일 크기:", f"{len(image_bytes):,} bytes")
+            st.write("파일 첫 16바이트:", format_header_bytes(image_bytes))
             st.write("오류:", str(exc))
         return None
 
