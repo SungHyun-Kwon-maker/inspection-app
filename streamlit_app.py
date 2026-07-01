@@ -1,12 +1,22 @@
-import datetime
-from datetime import datetime as dt
+from io import BytesIO
+from pathlib import Path
 
+import numpy as np
+import openvino as ov
 import streamlit as st
+from PIL import Image, ImageOps, UnidentifiedImageError
+
+
+APP_DIR = Path(__file__).resolve().parent
+MODEL_XML = APP_DIR / "weights" / "leather_model.xml"
+MODEL_BIN = MODEL_XML.with_suffix(".bin")
+INPUT_SIZE = (224, 224)
+CLASS_NAMES = ("정상", "불량")
 
 
 st.set_page_config(
-    page_title="Streamlit Practice Lab",
-    page_icon="S",
+    page_title="Leather Inspection",
+    page_icon="I",
     layout="wide",
 )
 
@@ -14,16 +24,16 @@ st.markdown(
     """
     <style>
     .stApp {
-        background: #f5f7fb;
+        background: #f4f6f8;
     }
     [data-testid="stSidebar"] {
-        background: #111827;
+        background: #121826;
     }
     [data-testid="stSidebar"] * {
         color: #f9fafb;
     }
     .block-container {
-        padding-top: 2rem;
+        padding-top: 1.8rem;
         padding-bottom: 3rem;
     }
     .hero {
@@ -38,7 +48,7 @@ st.markdown(
     .hero h1 {
         color: #111827;
         font-size: 2.35rem;
-        line-height: 1.15;
+        line-height: 1.12;
         margin: 0 0 10px 0;
         letter-spacing: 0;
     }
@@ -47,20 +57,29 @@ st.markdown(
         font-size: 1rem;
         margin: 0;
     }
-    .section-title {
-        color: #111827;
-        font-size: 1.2rem;
-        font-weight: 800;
-        margin: 16px 0 8px 0;
-    }
-    .run-box {
-        background: #111827;
-        color: #f9fafb;
+    .panel {
+        background: #ffffff;
+        border: 1px solid #e5e7eb;
         border-radius: 8px;
-        padding: 14px 16px;
-        font-family: monospace;
-        font-size: 0.9rem;
-        margin: 8px 0 16px 0;
+        padding: 18px;
+        margin-bottom: 14px;
+        box-shadow: 0 8px 20px rgba(16, 24, 40, 0.05);
+    }
+    .result-ok {
+        border-left: 8px solid #16a34a;
+    }
+    .result-bad {
+        border-left: 8px solid #dc2626;
+    }
+    .result-title {
+        color: #111827;
+        font-size: 1.8rem;
+        font-weight: 800;
+        margin-bottom: 4px;
+    }
+    .muted {
+        color: #6b7280;
+        font-size: 0.95rem;
     }
     div[data-testid="stMetric"] {
         background: #ffffff;
@@ -69,244 +88,210 @@ st.markdown(
         padding: 14px 16px;
         box-shadow: 0 6px 16px rgba(16, 24, 40, 0.05);
     }
-    div[data-testid="stDataFrame"] {
-        border: 1px solid #e5e7eb;
-        border-radius: 8px;
-        overflow: hidden;
-    }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
 
-def hero(title, subtitle):
+def hero():
     st.markdown(
-        f"""
+        """
         <div class="hero">
-            <h1>{title}</h1>
-            <p>{subtitle}</p>
+            <h1>Leather Defect Inspection</h1>
+            <p>OpenVINO 모델로 가죽 이미지의 정상/불량 여부를 빠르게 판정합니다.</p>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
 
-def section(title):
-    st.markdown(f"<div class='section-title'>{title}</div>", unsafe_allow_html=True)
+def is_lfs_pointer(path):
+    if not path.exists():
+        return False
+    try:
+        return path.read_bytes()[:80].startswith(b"version https://git-lfs.github.com/spec")
+    except OSError:
+        return False
 
 
-def run_box(command):
-    st.markdown(f"<div class='run-box'>{command}</div>", unsafe_allow_html=True)
+def validate_model_files():
+    missing = [path for path in (MODEL_XML, MODEL_BIN) if not path.exists()]
+    if missing:
+        st.error("모델 파일을 찾을 수 없습니다.")
+        st.write("누락된 파일:", [str(path) for path in missing])
+        st.stop()
+
+    if is_lfs_pointer(MODEL_BIN):
+        st.error("모델 가중치 파일이 Git LFS 포인터 상태입니다.")
+        st.write("배포 환경에서 Git LFS 파일이 실제 모델 파일로 내려받아져야 합니다.")
+        with st.expander("확인 정보"):
+            st.write("모델 XML:", str(MODEL_XML))
+            st.write("모델 BIN:", str(MODEL_BIN))
+            st.write("BIN 크기:", f"{MODEL_BIN.stat().st_size:,} bytes")
+            st.code("git lfs pull", language="bash")
+        st.stop()
 
 
-def overview_page():
-    hero(
-        "Streamlit 사용하기",
-        "여러 실습 파일을 하나로 합친 단일 Streamlit 앱입니다.",
+@st.cache_resource(show_spinner=False)
+def load_model():
+    validate_model_files()
+    core = ov.Core()
+    model = core.read_model(str(MODEL_XML))
+    return core.compile_model(model, "CPU")
+
+
+def detect_image_signature(image_bytes):
+    header = image_bytes[:32]
+    stripped = image_bytes[:100].lstrip().lower()
+
+    if header.startswith(b"\xff\xd8\xff"):
+        return "JPEG"
+    if header.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "PNG"
+    if header[:4] == b"RIFF" and header[8:12] == b"WEBP":
+        return "WEBP"
+    if header[4:12] in {b"ftypavif", b"ftypheic", b"ftypheix", b"ftypmif1", b"ftypmsf1"}:
+        return "AVIF/HEIC"
+    if stripped.startswith((b"<!doctype html", b"<html")):
+        return "HTML"
+    return "알 수 없음"
+
+
+def load_image(uploaded_file):
+    image_bytes = uploaded_file.getvalue()
+    if not image_bytes:
+        st.error("이미지 파일이 비어 있습니다.")
+        return None
+
+    try:
+        image = Image.open(BytesIO(image_bytes))
+        image.load()
+        return ImageOps.exif_transpose(image).convert("RGB")
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
+        detected = detect_image_signature(image_bytes)
+        st.error("이미지를 읽을 수 없습니다. JPG 또는 PNG 파일을 업로드해주세요.")
+        with st.expander("파일 정보"):
+            st.write("파일명:", getattr(uploaded_file, "name", "카메라 입력"))
+            st.write("브라우저 파일 형식:", getattr(uploaded_file, "type", "알 수 없음"))
+            st.write("감지된 파일 내용:", detected)
+            st.write("파일 크기:", f"{len(image_bytes):,} bytes")
+            st.write("오류:", str(exc))
+        return None
+
+
+def preprocess(image):
+    resized = image.convert("RGB").resize(INPUT_SIZE)
+    arr = np.array(resized, dtype=np.float32)
+
+    arr = arr[:, :, ::-1]
+    arr[:, :, 0] -= 103.94
+    arr[:, :, 1] -= 116.78
+    arr[:, :, 2] -= 123.68
+
+    return np.expand_dims(arr, axis=0)
+
+
+def predict(compiled_model, image):
+    arr = preprocess(image)
+    result = compiled_model(arr)
+
+    try:
+        output = result[compiled_model.output(0)]
+    except Exception:
+        output = result[0]
+
+    defect_probability = float(np.ravel(output)[0])
+    return max(0.0, min(1.0, defect_probability))
+
+
+def result_panel(defect_probability, threshold):
+    normal_probability = 1.0 - defect_probability
+    is_defect = defect_probability >= threshold
+    label = CLASS_NAMES[1 if is_defect else 0]
+    panel_class = "result-bad" if is_defect else "result-ok"
+    subtitle = "불량 가능성이 기준값 이상입니다." if is_defect else "불량 가능성이 기준값보다 낮습니다."
+
+    st.markdown(
+        f"""
+        <div class="panel {panel_class}">
+            <div class="result-title">{label}</div>
+            <div class="muted">{subtitle}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
-    metric_1, metric_2, metric_3, metric_4 = st.columns(4)
-    metric_1.metric("구성", "1개 파일")
-    metric_2.metric("핵심 위젯", "8개 주제")
-    metric_3.metric("외부 시각화", "불필요")
-    metric_4.metric("배포 파일", "streamlit_app.py")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("정상 확률", f"{normal_probability:.1%}")
+    col2.metric("불량 확률", f"{defect_probability:.1%}")
+    col3.metric("판정 기준", f"{threshold:.0%}")
+    st.progress(defect_probability, text=f"불량 확률 {defect_probability:.1%}")
 
-    section("Streamlit Cloud 설정")
-    st.table(
-        [
-            {"항목": "Repository", "값": "SungHyun-Kwon-maker/inspection-app"},
-            {"항목": "Branch", "값": "main"},
-            {"항목": "Main file path", "값": "streamlit_app.py"},
-        ]
+
+hero()
+
+with st.sidebar:
+    st.title("Inspection")
+    threshold = st.slider("불량 판정 기준", 0.05, 0.95, 0.50, 0.05)
+    st.divider()
+    st.caption("입력 크기")
+    st.write(f"{INPUT_SIZE[0]} x {INPUT_SIZE[1]}")
+    st.caption("모델")
+    st.write("OpenVINO CPU")
+    st.caption("클래스")
+    st.write("정상 / 불량")
+
+try:
+    model = load_model()
+except Exception as exc:
+    st.error("모델 로드 중 오류가 발생했습니다.")
+    with st.expander("오류 상세"):
+        st.exception(exc)
+    st.stop()
+
+input_col, result_col = st.columns([1.05, 0.95])
+
+with input_col:
+    st.markdown('<div class="panel">', unsafe_allow_html=True)
+    st.subheader("이미지 입력")
+    input_method = st.radio(
+        "입력 방식",
+        ["파일 업로드", "카메라 촬영"],
+        horizontal=True,
     )
 
-    section("로컬 실행 명령")
-    run_box("streamlit run streamlit_app.py")
-
-    section("실습 구성")
-    st.dataframe(
-        [
-            {"파트": "Title", "Streamlit API": "st.title", "내용": "페이지 제목 표시"},
-            {"파트": "Input", "Streamlit API": "st.text_input", "내용": "텍스트 입력"},
-            {"파트": "Button", "Streamlit API": "st.button", "내용": "버튼 클릭 이벤트"},
-            {"파트": "Text", "Streamlit API": "st.code / st.text", "내용": "코드와 텍스트 표시"},
-            {"파트": "Data", "Streamlit API": "st.dataframe / st.metric", "내용": "표와 지표 표시"},
-            {"파트": "Widgets", "Streamlit API": "checkbox/radio/selectbox", "내용": "입력 위젯"},
-            {"파트": "Graph", "Streamlit API": "st.line_chart / st.bar_chart", "내용": "기본 그래프"},
-            {"파트": "Session", "Streamlit API": "st.session_state", "내용": "상태 유지"},
-        ],
-        use_container_width=True,
-        hide_index=True,
-    )
-
-
-def title_input_page():
-    hero("Title & Input", "제목, 텍스트 입력, 버튼 기능을 한 화면에 정리했습니다.")
-
-    left, right = st.columns([1, 1])
-    with left:
-        section("Title")
-        st.title("This is a title")
-        st.title("_Streamlit_ is :blue[cool]")
-        st.caption("st.title()은 페이지의 큰 제목을 만들 때 사용합니다.")
-
-    with right:
-        section("AI 작사가")
-        topic = st.text_input("작사할 주제를 제시해주세요", "코딩")
-        mood = st.selectbox("분위기", ["밝게", "잔잔하게", "강렬하게"])
-        if st.button("입력", use_container_width=True):
-            st.success(f"{topic} 주제로 {mood} 가사를 만들 준비가 됐습니다.")
-
-
-def text_data_page():
-    hero("Text & Data", "코드 블록, 텍스트, 데이터 표, metric을 정리한 화면입니다.")
-
-    code_col, data_col = st.columns([1, 1.35])
-    with code_col:
-        section("Code Block")
-        code = '''def sample_func():
-    print("Sample 함수")'''
-        st.code(code, language="python")
-        st.text("ChatGPT 개발 교육 과정입니다.")
-
-    with data_col:
-        section("Sample Data")
-        rows = [
-            {"week": "1주차", "topic": "title", "score": 72, "status": "done"},
-            {"week": "2주차", "topic": "input", "score": 80, "status": "done"},
-            {"week": "3주차", "topic": "button", "score": 86, "status": "done"},
-            {"week": "4주차", "topic": "chart", "score": 91, "status": "review"},
-            {"week": "5주차", "topic": "session", "score": 95, "status": "done"},
-        ]
-        st.dataframe(rows, use_container_width=True, hide_index=True)
-
-    metric_1, metric_2, metric_3, metric_4 = st.columns(4)
-    metric_1.metric(label="생산량", value="54000개", delta="-150개")
-    metric_2.metric(label="영업이익률", value="18.2%", delta="1.4%")
-    metric_3.metric(label="수주잔고", value="3.8억", delta="-0.5억")
-    metric_4.metric(label="완료율", value="87%", delta="12%")
-
-
-def widgets_page():
-    hero("UI Widgets", "Streamlit 입력 위젯을 폼처럼 정리했습니다.")
-
-    left, right = st.columns([1, 1])
-    with left:
-        if st.button("버튼", use_container_width=True):
-            st.info("버튼이 눌렸습니다")
-
-        human = st.checkbox("사람이면 체크해주세요.")
-        if human:
-            st.success("당신은 사람이군요!")
-
-        religion = st.radio(
-            index=None,
-            label="당신의 종교는 무엇입니까?",
-            options=("기독교", "천주교", "불교", "기타", "무교"),
+    selected_image = None
+    if input_method == "파일 업로드":
+        uploaded = st.file_uploader(
+            "검사할 가죽 이미지를 업로드하세요",
+            type=["jpg", "jpeg", "png"],
         )
-        if religion:
-            st.write("당신의 종교는 *" + religion + "* 이군요!")
+        if uploaded is not None:
+            selected_image = load_image(uploaded)
+    else:
+        captured = st.camera_input("카메라로 검사할 이미지를 촬영하세요")
+        if captured is not None:
+            selected_image = load_image(captured)
 
-        school = st.selectbox(
-            index=None,
-            label="당신의 최종학력은 무엇입니까?",
-            options=("대학원졸", "대졸", "고졸"),
-        )
-        if school:
-            st.write("당신의 최종학력은 :sparkle:" + school + ":sparkle: 이군요!")
+    if selected_image is not None:
+        st.image(selected_image, caption="검사 대상 이미지", use_container_width=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
-    with right:
-        foods = st.multiselect(
-            "당신이 가장 좋아하는 음식은 뭔가요?",
-            ["돼지갈비", "소갈비", "스테이크", "생선회", "삼겹살", "김치찌개"],
-        )
-        if foods:
-            st.write(f"당신이 가장 좋아하는 음식은 {foods}입니다.")
+with result_col:
+    st.markdown('<div class="panel">', unsafe_allow_html=True)
+    st.subheader("검사 결과")
 
-        bp = st.slider("혈압 범위를 지정해주세요.", 6.0, 200.0, (90.0, 130.0))
-        st.write("이완기 혈압:", bp[0])
-        st.write("수축기 혈압:", bp[1])
+    if selected_image is None:
+        st.info("이미지를 입력하면 검사 결과가 표시됩니다.")
+    else:
+        if st.button("검사 시작", type="primary", use_container_width=True):
+            with st.spinner("이미지를 분석하는 중입니다."):
+                probability = predict(model, selected_image)
+            result_panel(probability, threshold)
+        else:
+            st.caption("검사 시작 버튼을 눌러 판정 결과를 확인하세요.")
 
-        birthday_time = st.slider(
-            "당신의 출생년월일 시각을 알려주세요",
-            min_value=dt(1950, 1, 1, 0, 0),
-            max_value=dt(2024, 3, 11, 12, 0),
-            step=datetime.timedelta(hours=1),
-            format="MM/DD/YY - HH:mm",
-        )
-        st.write(f"당신의 생년월일시는 {birthday_time}입니다.")
+    st.markdown("</div>", unsafe_allow_html=True)
 
-
-def graph_page():
-    hero("Graph Widgets", "Streamlit 기본 차트 API로 그래프를 출력합니다.")
-
-    chart_rows = [
-        {"week": "1주차", "visitors": 120, "submissions": 18},
-        {"week": "2주차", "visitors": 185, "submissions": 31},
-        {"week": "3주차", "visitors": 240, "submissions": 45},
-        {"week": "4주차", "visitors": 310, "submissions": 66},
-        {"week": "5주차", "visitors": 420, "submissions": 82},
-        {"week": "6주차", "visitors": 510, "submissions": 103},
-    ]
-
-    total_visitors = sum(row["visitors"] for row in chart_rows)
-    total_submissions = sum(row["submissions"] for row in chart_rows)
-
-    metric_1, metric_2, metric_3 = st.columns(3)
-    metric_1.metric("총 방문", f"{total_visitors:,}")
-    metric_2.metric("총 제출", f"{total_submissions:,}")
-    metric_3.metric("전환율", f"{total_submissions / total_visitors:.1%}")
-
-    left, right = st.columns(2)
-    with left:
-        section("방문 추이")
-        st.line_chart(chart_rows, x="week", y="visitors", use_container_width=True)
-    with right:
-        section("제출 수")
-        st.bar_chart(chart_rows, x="week", y="submissions", use_container_width=True)
-
-
-def session_page():
-    hero("Session State", "버튼을 눌러도 값이 유지되는 카운터 예제입니다.")
-
-    if "count" not in st.session_state:
-        st.session_state["count"] = 0
-
-    count_col, button_col = st.columns([2, 1])
-    count_col.metric("카운터", st.session_state["count"])
-
-    if button_col.button("누르세요", use_container_width=True):
-        st.session_state["count"] += 1
-        st.rerun()
-
-    if st.button("초기화", use_container_width=True):
-        st.session_state["count"] = 0
-        st.rerun()
-
-
-st.sidebar.title("Streamlit Lab")
-page = st.sidebar.radio(
-    "페이지",
-    [
-        "Overview",
-        "Title & Input",
-        "Text & Data",
-        "Widgets",
-        "Graph",
-        "Session",
-    ],
-)
-
-if page == "Overview":
-    overview_page()
-elif page == "Title & Input":
-    title_input_page()
-elif page == "Text & Data":
-    text_data_page()
-elif page == "Widgets":
-    widgets_page()
-elif page == "Graph":
-    graph_page()
-else:
-    session_page()
+st.caption("VGG16 전처리 기준으로 RGB 이미지를 224 x 224 크기로 변환한 뒤 OpenVINO 모델에 입력합니다.")
