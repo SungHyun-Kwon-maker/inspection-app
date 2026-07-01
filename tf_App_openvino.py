@@ -13,8 +13,9 @@ OpenVINO 모델(.xml / .bin)로 이진분류 추론하는 기본 구조 예제.
 
 import streamlit as st
 import numpy as np
+from io import BytesIO
 from pathlib import Path
-from PIL import Image
+from PIL import Image, ImageOps, UnidentifiedImageError
 import openvino as ov
 
 # ── 상수 ──────────────────────────────────────
@@ -62,6 +63,26 @@ def show_model_path_debug(missing_files):
             "weights 내부:",
             [path.name for path in MODEL_DIR.glob("*")] if MODEL_DIR.exists() else "없음",
         )
+
+
+def load_input_image(image_file):
+    image_bytes = image_file.getvalue()
+    if not image_bytes:
+        st.error("이미지 파일이 비어 있습니다. 다른 파일을 선택해주세요.")
+        return None
+
+    try:
+        image = Image.open(BytesIO(image_bytes))
+        image.load()
+        return ImageOps.exif_transpose(image).convert("RGB")
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
+        st.error("이미지를 읽을 수 없습니다. JPG, JPEG, PNG 파일로 다시 저장한 뒤 업로드해주세요.")
+        with st.expander("파일 정보"):
+            st.write("파일명:", getattr(image_file, "name", "카메라 입력"))
+            st.write("파일 형식:", getattr(image_file, "type", "알 수 없음"))
+            st.write("파일 크기:", f"{len(image_bytes):,} bytes")
+            st.write("오류:", str(exc))
+        return None
 
 
 # ─────────────────────────────────────────────
@@ -123,14 +144,16 @@ pil_image = None
 if input_method == "파일 업로드":
     file = st.file_uploader("이미지를 선택하세요", type=["jpg", "jpeg", "png"])
     if file:
-        pil_image = Image.open(file).convert("RGB")
-        st.image(pil_image, caption="업로드된 이미지", width=300)
+        pil_image = load_input_image(file)
+        if pil_image is not None:
+            st.image(pil_image, caption="업로드된 이미지", width=300)
 
 elif input_method == "카메라 촬영":
     shot = st.camera_input("카메라로 촬영")
     if shot:
-        pil_image = Image.open(shot).convert("RGB")
-        st.image(pil_image, caption="촬영된 이미지", width=300)
+        pil_image = load_input_image(shot)
+        if pil_image is not None:
+            st.image(pil_image, caption="촬영된 이미지", width=300)
 
 # ── 검사 버튼 ──
 if st.button("검사 시작", type="primary"):
