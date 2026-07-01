@@ -226,7 +226,8 @@ def result_panel(defect_probability, threshold):
     col1.metric("정상 확률", f"{normal_probability:.1%}")
     col2.metric("불량 확률", f"{defect_probability:.1%}")
     col3.metric("판정 기준", f"{threshold:.0%}")
-    st.progress(defect_probability, text=f"불량 확률 {defect_probability:.1%}")
+    st.progress(defect_probability)
+    st.caption(f"불량 확률 {defect_probability:.1%}")
 
 
 hero()
@@ -275,7 +276,7 @@ with input_col:
             selected_image = load_image(captured)
 
     if selected_image is not None:
-        st.image(selected_image, caption="검사 대상 이미지", use_container_width=True)
+        st.image(selected_image, caption="검사 대상 이미지", width=420)
     st.markdown("</div>", unsafe_allow_html=True)
 
 with result_col:
@@ -285,7 +286,7 @@ with result_col:
     if selected_image is None:
         st.info("이미지를 입력하면 검사 결과가 표시됩니다.")
     else:
-        if st.button("검사 시작", type="primary", use_container_width=True):
+        if st.button("검사 시작", type="primary"):
             with st.spinner("이미지를 분석하는 중입니다."):
                 probability = predict(model, selected_image)
             result_panel(probability, threshold)
