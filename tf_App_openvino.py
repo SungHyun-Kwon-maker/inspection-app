@@ -13,14 +13,17 @@ OpenVINO 모델(.xml / .bin)로 이진분류 추론하는 기본 구조 예제.
 
 import streamlit as st
 import numpy as np
-import os
+from pathlib import Path
 from PIL import Image
 import openvino as ov
 
 # ── 상수 ──────────────────────────────────────
 INPUT_IMG_SIZE = (224, 224)
 CLASSES        = ["정상", "불량"]
-MODEL_XML      = "./weights/leather_model.xml"   # .bin 은 자동 탐색
+APP_DIR        = Path(__file__).resolve().parent
+MODEL_DIR      = APP_DIR / "weights"
+MODEL_XML      = MODEL_DIR / "leather_model.xml"
+MODEL_BIN      = MODEL_XML.with_suffix(".bin")
 
 
 # ─────────────────────────────────────────────
@@ -41,11 +44,24 @@ st.caption("VGG16 + OpenVINO 기반 가죽 제품 불량 검사")
 # ─────────────────────────────────────────────
 @st.cache_resource
 def load_model():
-    if not os.path.exists(MODEL_XML):
-        return None
     core  = ov.Core()
-    model = core.read_model(MODEL_XML)
+    model = core.read_model(str(MODEL_XML))
     return core.compile_model(model, "CPU")
+
+
+def show_model_path_debug(missing_files):
+    st.error("모델 파일을 찾을 수 없습니다.")
+    st.write("누락된 파일:", [str(path) for path in missing_files])
+
+    with st.expander("경로 디버그 정보"):
+        st.write("현재 작업 경로:", str(Path.cwd()))
+        st.write("현재 파일 위치:", str(Path(__file__).resolve()))
+        st.write("모델 폴더:", str(MODEL_DIR))
+        st.write("weights 존재:", MODEL_DIR.exists())
+        st.write(
+            "weights 내부:",
+            [path.name for path in MODEL_DIR.glob("*")] if MODEL_DIR.exists() else "없음",
+        )
 
 
 # ─────────────────────────────────────────────
@@ -85,10 +101,17 @@ def predict(compiled_model, pil_img):
 # ─────────────────────────────────────────────
 # 5. 메인 UI
 # ─────────────────────────────────────────────
-compiled_model = load_model()
+missing_model_files = [path for path in (MODEL_XML, MODEL_BIN) if not path.exists()]
+if missing_model_files:
+    show_model_path_debug(missing_model_files)
+    st.stop()
 
-if compiled_model is None:
-    st.error(f"모델 파일을 찾을 수 없습니다: `{MODEL_XML}`")
+try:
+    compiled_model = load_model()
+except Exception as exc:
+    st.error("모델 로드 중 오류가 발생했습니다.")
+    with st.expander("오류 상세"):
+        st.exception(exc)
     st.stop()
 
 # ── 입력 방법 선택 ──
