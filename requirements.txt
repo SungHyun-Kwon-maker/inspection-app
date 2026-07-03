@@ -1,11 +1,6 @@
-# requirements_ov.txt
-# tf_App_openvino.py (OpenVINO 모델 .xml/.bin) 배포용 패키지 목록
-# 사용 라이브러리: streamlit, openvino, numpy, pillow(PIL)
-streamlit==1.38.0
-openvino==2024.6.0
-numpy==1.26.4
-pillow==10.4.0
-pandas==2.2.2
-matplotlib==3.9.2
-seaborn==0.13.2
-scikit-learn==1.5.1
+# 드론 기종·조건 분류 앱 (drone_app.py) — 순수 OpenVINO (torch/ultralytics 불필요)
+streamlit==1.58.0
+openvino==2026.2.1
+numpy==2.2.6
+pillow==11.1.0
+pandas==2.2.3

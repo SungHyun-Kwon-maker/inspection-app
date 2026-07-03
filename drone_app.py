@@ -1,15 +1,16 @@
-"""드론 기종·촬영조건 분류 데모 (OpenVINO + Streamlit).
+"""드론 기종·촬영조건 분류 데모 (순수 OpenVINO + Streamlit, torch 불필요).
 
-파이프라인: 이미지 업로드 → YOLO 드론 검출(OpenVINO) → 드론 크롭 → 분류기(OpenVINO) → 기종 + 조건
+파이프라인: 이미지 업로드 → YOLOv8 드론 검출(OpenVINO) → 드론 크롭 → 분류기(OpenVINO) → 기종 + 조건
 
-실행하려면 이 파일과 같은 폴더에 `drone_weights/` 가 있어야 한다:
+배포/실행에 필요한 것(이 파일과 같은 폴더):
     drone_weights/
       ├── mobilenet_v2.xml (+ .bin)
       ├── efficientnet_v2_s.xml (+ .bin)
-      └── detector_openvino/   (YOLOv8n OpenVINO export 폴더: best.xml/.bin/metadata.yaml)
-그리고 requirements 에 `ultralytics` 가 필요하다.
+      └── detector.xml (+ .bin)          # YOLOv8n OpenVINO IR
+requirements: streamlit, openvino, numpy, pillow, pandas  (torch / ultralytics 불필요)
 
 로컬 실행:  streamlit run drone_app.py
+Streamlit Cloud:  배포 시 Main file 을 drone_app.py 로 지정
 """
 from __future__ import annotations
 
@@ -20,17 +21,16 @@ import openvino as ov
 import pandas as pd
 import streamlit as st
 from PIL import Image, ImageDraw
-from ultralytics import YOLO
 
 APP_DIR = Path(__file__).resolve().parent
 W = APP_DIR / "drone_weights"
-DETECTOR_DIR = W / "detector_openvino"
+DETECTOR_XML = W / "detector.xml"
 CLASSIFIER_XML = {
     "MobileNetV2 (권장, 0.894)": W / "mobilenet_v2.xml",
     "EfficientNetV2-S (0.862)": W / "efficientnet_v2_s.xml",
 }
 
-# 학습 시 class_to_idx 순서와 동일해야 함 (기종 3 × 조건 3)
+# 학습 시 class_to_idx 순서와 동일 (기종 3 × 조건 3)
 CLASS_NAMES = [
     "L1_LC_VTOL_sunny", "L1_LC_VTOL_snow", "L1_LC_VTOL_low-light",
     "L3_QUAD_MC_sunny", "L3_QUAD_MC_snow", "L3_QUAD_MC_low-light",
@@ -42,17 +42,42 @@ COND_KR = {"sunny": "맑음", "snow": "설경", "low-light": "저조도"}
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 IMG_SIZE = 224
+DET_SIZE = 1280
 
 
-@st.cache_resource(show_spinner="OpenVINO 검출기 로드 중...")
-def load_detector() -> YOLO:
-    return YOLO(str(DETECTOR_DIR))
-
-
-@st.cache_resource(show_spinner="OpenVINO 분류기 로드 중...")
-def load_classifier(xml_path: str):
+@st.cache_resource(show_spinner="OpenVINO 모델 로드 중...")
+def load_model(xml_path: str):
     core = ov.Core()
     return core.compile_model(core.read_model(xml_path), "CPU")
+
+
+# ---------------- YOLOv8 (OpenVINO) 검출 ----------------
+def letterbox(im: Image.Image, new: int = DET_SIZE, color: int = 114):
+    w, h = im.size
+    r = min(new / w, new / h)
+    nw, nh = round(w * r), round(h * r)
+    canvas = Image.new("RGB", (new, new), (color, color, color))
+    left, top = (new - nw) // 2, (new - nh) // 2
+    canvas.paste(im.resize((nw, nh), Image.BILINEAR), (left, top))
+    return canvas, r, left, top
+
+
+def detect_drone(detector, im: Image.Image, conf: float):
+    """가장 신뢰도 높은 드론 박스 하나를 원본 좌표(x1,y1,x2,y2,conf)로 반환. 없으면 None."""
+    canvas, r, left, top = letterbox(im)
+    x = (np.asarray(canvas, np.float32) / 255.0).transpose(2, 0, 1)[None]
+    out = detector(x)[detector.output(0)][0]  # (5, N): cx,cy,w,h,score
+    preds = out.T
+    scores = preds[:, 4]
+    i = int(scores.argmax())
+    if float(scores[i]) < conf:
+        return None
+    cx, cy, bw, bh = preds[i, :4]
+    x1 = ((cx - bw / 2) - left) / r
+    y1 = ((cy - bh / 2) - top) / r
+    x2 = ((cx + bw / 2) - left) / r
+    y2 = ((cy + bh / 2) - top) / r
+    return [float(x1), float(y1), float(x2), float(y2), float(scores[i])]
 
 
 def square_crop_box(x1, y1, x2, y2, W_, H_, margin=0.30, min_side_frac=0.06):
@@ -72,6 +97,7 @@ def center_crop_box(W_, H_, frac=0.65):
     return int(W_ / 2 - half), int(H_ / 2 - half), int(W_ / 2 + half), int(H_ / 2 + half)
 
 
+# ---------------- 분류기 전처리 ----------------
 def preprocess_for_classifier(crop: Image.Image) -> np.ndarray:
     img = crop.convert("RGB")
     w, h = img.size
@@ -90,21 +116,23 @@ def softmax(x: np.ndarray) -> np.ndarray:
     return e / e.sum()
 
 
+# ---------------- UI ----------------
 st.set_page_config(page_title="드론 기종·조건 분류", page_icon="🚁", layout="wide")
 st.title("🚁 드론 기종 · 촬영조건 분류 (OpenVINO)")
 st.caption("이미지 업로드 → YOLO 드론 검출 → 크롭 → 분류기(OpenVINO)로 기종 + 조건 예측")
 
-if not DETECTOR_DIR.exists() or not any(p.exists() for p in CLASSIFIER_XML.values()):
-    st.error("모델 파일이 없습니다. 이 파일 옆에 `drone_weights/`(분류기 xml/bin + detector_openvino/)를 넣어주세요.")
+if not DETECTOR_XML.exists() or not any(p.exists() for p in CLASSIFIER_XML.values()):
+    st.error("모델 파일이 없습니다. 이 파일 옆에 `drone_weights/`(mobilenet_v2 / efficientnet_v2_s / detector 의 .xml·.bin)를 넣어주세요.")
     st.stop()
 
 with st.sidebar:
     st.header("설정")
     model_label = st.selectbox("분류 모델", list(CLASSIFIER_XML.keys()))
     conf_thr = st.slider("드론 검출 신뢰도 임계값", 0.05, 0.9, 0.15, 0.05)
+    st.caption("검출·분류 모두 OpenVINO CPU 추론 (torch 불필요)")
 
-detector = load_detector()
-classifier = load_classifier(str(CLASSIFIER_XML[model_label]))
+detector = load_model(str(DETECTOR_XML))
+classifier = load_model(str(CLASSIFIER_XML[model_label]))
 
 uploaded = st.file_uploader("드론 이미지 업로드", type=["jpg", "jpeg", "png", "bmp", "webp"])
 if uploaded is None:
@@ -114,12 +142,9 @@ if uploaded is None:
 image = Image.open(uploaded).convert("RGB")
 W_, H_ = image.size
 
-det_res = detector.predict(image, imgsz=1280, conf=conf_thr, verbose=False)[0]
-boxes = det_res.boxes
-if boxes is not None and len(boxes) > 0:
-    i = int(boxes.conf.argmax())
-    x1, y1, x2, y2 = boxes.xyxy[i].tolist()
-    det_conf = float(boxes.conf[i])
+box = detect_drone(detector, image, conf_thr)
+if box is not None:
+    x1, y1, x2, y2, det_conf = box
     bx = square_crop_box(x1, y1, x2, y2, W_, H_)
     fallback = False
 else:
